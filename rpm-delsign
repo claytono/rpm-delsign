@@ -1,0 +1,102 @@
+#!/usr/bin/env ruby
+
+# RPM's --delsign argument appears to not always work:
+# http://lists.opensuse.org/opensuse-factory/2011-08/msg00445.html
+
+# This program will read the RPM and parse the signture section, and
+# replace any signatures with an obsolete SHA tag that we know RPM
+# will ignore.  This will effectively remove the signature without us
+# having to recalculate the payload md5, size, etc that RPM normally
+# does on a --delsign operation.
+
+# This doesn't do much error checking, sorry.
+
+RPMSIGTAG_BADSHA1_1 = 0x0108
+CORRUPT_VALUE = RPMSIGTAG_BADSHA1_1
+
+TAG_INDEX = {
+  62       => { :name => "SIGNATURE SECTION" },
+  256 + 13 => { :name => "SHA1 HEADER" },
+  1000     => { :name => "RPMSIGTAG_SIZE" },
+  1001     => { :name => "RPMSIGTAG_LEMD5_1" },
+  1002     => { :name => "RPMSIGTAG_PGP", :corrupt => true },
+  1003     => { :name => "RPMSIGTAG_LEMD5_2" },
+  1004     => { :name => "RPMSIGTAG_MD5", },
+  1005     => { :name => "RPMSIGTAG_GPG", :corrupt => true},
+  1006     => { :name => "RPMSIGTAG_PGP5", :corrupt => true },
+  1007     => { :name => "RPMSIGTAG_PAYLOADSIZE" },
+}
+
+def corrupt_signature(input, output)
+  sig_header = input.read(8)
+  output.write(sig_header)
+  sig_entries, sig_size = sig_header.unpack('N2');
+  puts "Signature entries: #{sig_entries}"
+  puts "Signature entry size: #{sig_size}"
+  puts
+
+  1.upto(sig_entries) do
+    tag, type, offset, count = input.read(16).unpack('N4')
+    print "Tag ##{tag}:"
+    if TAG_INDEX.key?(tag)
+      print "#{ TAG_INDEX[tag][:name] }"
+      if TAG_INDEX[tag][:corrupt]
+        puts " -> corrupted"
+        tag = CORRUPT_VALUE
+      else
+        puts " -> copied"
+      end
+    else
+      puts "Unknown -> copied"
+    end
+
+    output.write([tag, type, offset, count].pack('N4'))
+  end
+end
+
+def delsign(filename)
+  input = File.open(filename)
+  puts "Processing: #{filename}\n";
+  lead = input.read(96)
+
+  magic = input.read(8)
+  unless magic.unpack('N2').first == 0x8eade801
+    $stderr.printf "Bad magic in #{filename}: 0x%08x\n", magic.first
+    exit 1
+  end
+
+  output = File.open(filename + ".tmp", "w")
+  output.write(lead)
+  output.write(magic)
+
+  corrupt_signature(input, output)
+
+  puts "Copying remainder"
+  buffer = ''
+  while buffer = input.read(64*1024)
+    output.write(buffer)
+  end
+  input.close
+  output.close
+  File.rename(filename + ".tmp", filename)
+end
+
+if ARGV.empty?
+  $stderr.puts "Usage: rpm-delsign <rpm> [rpm] [..]"
+  exit 1
+end
+
+missing_files = []
+ARGV.each do |fn|
+  missing_files << fn unless File.exists?(fn)
+end
+
+unless missing_files.empty?
+  $stderr.puts "Cannot find the following files:"
+  missing_files.each do |fn|
+    $stderr.puts "  " + fn
+  end
+  exit 1
+end
+
+ARGV.each { |fn| delsign(fn) }
