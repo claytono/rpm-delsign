@@ -4,45 +4,44 @@
 # http://lists.opensuse.org/opensuse-factory/2011-08/msg00445.html
 
 # This program will read the RPM and parse the signture section, and
-# replace any signatures with an obsolete SHA tag that we know RPM
-# will ignore.  This will effectively remove the signature without us
-# having to recalculate the payload md5, size, etc that RPM normally
-# does on a --delsign operation.
+# remove any signature data index entries, but leaves the data in
+# place so that we don't have to recalculate offsets, etc.
 
 # This doesn't do much error checking, sorry.
-
-RPMSIGTAG_BADSHA1_1 = 0x0108
-CORRUPT_VALUE = RPMSIGTAG_BADSHA1_1
+RPMTAG_SIG_BASE = 256
 
 TAG_INDEX = {
   62       => { :name => "SIGNATURE SECTION" },
-  256 + 13 => { :name => "SHA1 HEADER" },
+  RPMTAG_SIG_BASE + 8 => { :name => "RPMTAG_BADSHA1_1", :remove => true },
+  RPMTAG_SIG_BASE + 9 => { :name => "RPMTAG_BADSHA1_2", :remove => true },
+  RPMTAG_SIG_BASE + 13 => { :name => "SHA1 HEADER" },
   1000     => { :name => "RPMSIGTAG_SIZE" },
   1001     => { :name => "RPMSIGTAG_LEMD5_1" },
-  1002     => { :name => "RPMSIGTAG_PGP", :corrupt => true },
+  1002     => { :name => "RPMSIGTAG_PGP", :remove => true },
   1003     => { :name => "RPMSIGTAG_LEMD5_2" },
   1004     => { :name => "RPMSIGTAG_MD5", },
-  1005     => { :name => "RPMSIGTAG_GPG", :corrupt => true},
-  1006     => { :name => "RPMSIGTAG_PGP5", :corrupt => true },
+  1005     => { :name => "RPMSIGTAG_GPG", :remove => true},
+  1006     => { :name => "RPMSIGTAG_PGP5", :remove => true },
   1007     => { :name => "RPMSIGTAG_PAYLOADSIZE" },
 }
 
-def corrupt_signature(input, output)
+def fixup_signature(input, output)
   sig_header = input.read(8)
-  output.write(sig_header)
-  sig_entries, sig_size = sig_header.unpack('N2');
-  puts "Signature entries: #{sig_entries}"
-  puts "Signature entry size: #{sig_size}"
+  sig_entries, sig_data_size = sig_header.unpack('N2');
+  puts "Existing signature index entries: #{sig_entries}"
+  puts "Existing signature data size: #{sig_data_size}"
   puts
 
+  new_signature_data = ''
+  new_entry_count = 0
   1.upto(sig_entries) do
     tag, type, offset, count = input.read(16).unpack('N4')
     print "Tag ##{tag}:"
     if TAG_INDEX.key?(tag)
       print "#{ TAG_INDEX[tag][:name] }"
-      if TAG_INDEX[tag][:corrupt]
-        puts " -> corrupted"
-        tag = CORRUPT_VALUE
+      if TAG_INDEX[tag][:remove]
+        puts " -> removed"
+        next
       else
         puts " -> copied"
       end
@@ -50,8 +49,12 @@ def corrupt_signature(input, output)
       puts "Unknown -> copied"
     end
 
-    output.write([tag, type, offset, count].pack('N4'))
+    new_entry_count += 1
+    new_signature_data += [tag, type, offset, count].pack('N4')
   end
+
+  output.write([new_entry_count, sig_data_size].pack('N2'))
+  output.write(new_signature_data)
 end
 
 def delsign(filename)
@@ -69,7 +72,7 @@ def delsign(filename)
   output.write(lead)
   output.write(magic)
 
-  corrupt_signature(input, output)
+  fixup_signature(input, output)
 
   puts "Copying remainder"
   buffer = ''
