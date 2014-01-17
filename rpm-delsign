@@ -8,10 +8,13 @@
 # place so that we don't have to recalculate offsets, etc.
 
 # This doesn't do much error checking, sorry.
+
 RPMTAG_SIG_BASE = 256
+RPMTAG_HEADERSIGNATURES = 62
+RPM_BIN_TYPE = 7
 
 TAG_INDEX = {
-  62       => { :name => "SIGNATURE SECTION" },
+  62       => { :name => "SIGNATURE REGION", :remove => true },
   RPMTAG_SIG_BASE + 8 => { :name => "RPMTAG_BADSHA1_1", :remove => true },
   RPMTAG_SIG_BASE + 9 => { :name => "RPMTAG_BADSHA1_2", :remove => true },
   RPMTAG_SIG_BASE + 13 => { :name => "SHA1 HEADER" },
@@ -25,36 +28,96 @@ TAG_INDEX = {
   1007     => { :name => "RPMSIGTAG_PAYLOADSIZE" },
 }
 
+def calculate_header_data_sizes(entries, header_data_size)
+  # sort by offset and then calculate lengths
+  entries = entries.sort { |a,b| a[:offset] <=> b[:offset] }
+  0.upto(entries.size - 2) do |i|
+    entries[i][:size] = entries[i + 1][:offset] - entries[i][:offset]
+  end
+
+  entries.last[:size] = header_data_size -= entries.last[:offset]
+  return entries.sort { |a,b| a[:tag] <=> b[:tag] }
+end
+
+def read_header_entries(input, num_entries, entry_data_size)
+  entries = []
+  1.upto(num_entries) do
+    tag, type, offset, count = input.read(16).unpack('N4')
+    entry = {
+      :tag => tag, :count => count,
+      :type => type, :offset => offset,
+      :remove => false, :name => "Unknown",
+    }
+
+    entry.merge!(TAG_INDEX[tag]) if TAG_INDEX.key?(tag)
+    entries << entry
+  end
+
+  return calculate_header_data_sizes(entries, entry_data_size)
+end
+
 def fixup_signature(input, output)
   sig_header = input.read(8)
-  sig_entries, sig_data_size = sig_header.unpack('N2');
-  puts "Existing signature index entries: #{sig_entries}"
+  num_sig_entries, sig_data_size = sig_header.unpack('N2');
+  puts "Existing signature index entries: #{num_sig_entries}"
   puts "Existing signature data size: #{sig_data_size}"
   puts
 
-  new_signature_data = ''
-  new_entry_count = 0
-  1.upto(sig_entries) do
-    tag, type, offset, count = input.read(16).unpack('N4')
-    print "Tag ##{tag}:"
-    if TAG_INDEX.key?(tag)
-      print "#{ TAG_INDEX[tag][:name] }"
-      if TAG_INDEX[tag][:remove]
-        puts " -> removed"
-        next
-      else
-        puts " -> copied"
-      end
+  entries = read_header_entries(input, num_sig_entries, sig_data_size)
+  data_offset = input.tell
+
+  new_sig_index, new_sig_data = '', ''
+  new_entry_count = 1 # Start at 1 for region marker
+  puts "Signature Tags:"
+  entries.each do |entry|
+    if entry[:remove]
+      new_offset = "N/A"
     else
-      puts "Unknown -> copied"
+      new_offset = new_sig_data.size
     end
 
+    puts "  Name:       #{entry[:name]} (##{entry[:tag]}):"
+    puts "  Remove:     #{entry[:remove]}"
+    puts "  Type:       #{entry[:type]}"
+    puts "  Old Offset: #{entry[:offset]}"
+    puts "  New Offset: #{new_offset}"
+    puts "  Size:       #{entry[:size]}"
+    puts
+
+    next if entry[:remove]
+
     new_entry_count += 1
-    new_signature_data += [tag, type, offset, count].pack('N4')
+    new_sig_index += [entry[:tag], entry[:type],
+                      new_offset, entry[:count]].pack('N4')
+
+    # Read each data item by seeking to the offset and reading the
+    # specific item.  We could just read the linearly, but it's
+    # possible that we could have overlapping fields, and we don't
+    # care if rewriting the signature is slow.
+    input.seek(data_offset + entry[:offset])
+    new_sig_data += input.read(entry[:size])
   end
 
-  output.write([new_entry_count, sig_data_size].pack('N2'))
-  output.write(new_signature_data)
+  # Append region marker to end of data section and region marker
+  # index to beginning of index.  This seems to be nearly undocumented
+  # and it's reverse engineered from existing packages.
+  region_index = [RPMTAG_HEADERSIGNATURES, RPM_BIN_TYPE,
+                  new_sig_data.size, 16].pack('N4')
+  region_data =  [RPMTAG_HEADERSIGNATURES, RPM_BIN_TYPE,
+                  new_entry_count * -16, 16].pack('N4')
+  new_sig_index = region_index + new_sig_index
+  new_sig_data  = new_sig_data + region_data
+
+  # Set the input file to the end of the signature section and write
+  # the fixed signature section to the new file.
+  input.seek(data_offset + sig_data_size)
+  output.write([new_entry_count, new_sig_data.size].pack('N2'))
+  output.write(new_sig_index + new_sig_data)
+
+  # The next header needs to be align on an 8 byte boundary.
+  while output.tell % 8 != 0
+    output.write("\0")
+  end
 end
 
 def delsign(filename)
@@ -81,7 +144,7 @@ def delsign(filename)
   end
   input.close
   output.close
-  File.rename(filename + ".tmp", filename)
+  File.rename(filename + ".tmp", filename) unless ENV['TESTING']
 end
 
 if ARGV.empty?
